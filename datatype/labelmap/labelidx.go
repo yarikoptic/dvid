@@ -22,6 +22,7 @@ import (
 	"github.com/janelia-flyem/dvid/server"
 	"github.com/janelia-flyem/dvid/storage"
 	lz4 "github.com/janelia-flyem/go/golz4-updated"
+	"golang.org/x/sync/errgroup"
 )
 
 const (
@@ -943,6 +944,54 @@ func (d *Data) FoundSparseVol(ctx *datastore.VersionedCtx, label uint64, bounds 
 	return false, nil
 }
 
+func (d *Data) writeBlocksConcurrently(ctx *datastore.VersionedCtx, scale uint8, indices dvid.IZYXSlice, writeOp *labels.OutputOp) error {
+	store, err := datastore.GetOrderedKeyValueDB(d)
+	if err != nil {
+		return err
+	}
+
+	concurrency := 10
+	if len(indices) < concurrency {
+		concurrency = len(indices)
+	}
+	izyxCh := make(chan dvid.IZYXString, concurrency)
+
+	g := new(errgroup.Group)
+	for i := 0; i < concurrency; i++ {
+		g.Go(func() error {
+			for izyx := range izyxCh {
+				tk := NewBlockTKeyByCoord(scale, izyx)
+				data, err := store.Get(ctx, tk)
+				if err != nil {
+					return err
+				}
+				if data == nil {
+					return fmt.Errorf("expected block %s to have key-value, but found none", izyx)
+				}
+				blockData, _, err := dvid.DeserializeData(data, true)
+				if err == nil {
+					return fmt.Errorf("fake deserialize error")
+				}
+				var block labels.Block
+				if err := block.UnmarshalBinary(blockData); err != nil {
+					return err
+				}
+				pb := labels.PositionedBlock{
+					Block:  block,
+					BCoord: izyx,
+				}
+				writeOp.Process(&pb)
+			}
+			return nil
+		})
+	}
+	for _, izyx := range indices {
+		izyxCh <- izyx
+	}
+	close(izyxCh)
+	return g.Wait()
+}
+
 // writeBinaryBlocks does a streaming write of an encoded sparse volume given a label.
 // It returns a bool whether the label was found in the given bounds and any error.
 func (d *Data) writeBinaryBlocks(ctx *datastore.VersionedCtx, label uint64, scale uint8, bounds dvid.Bounds, compression string, isSupervoxel bool, w io.Writer) (bool, error) {
@@ -965,48 +1014,23 @@ func (d *Data) writeBinaryBlocks(ctx *datastore.VersionedCtx, label uint64, scal
 	if err != nil {
 		return false, err
 	}
+	if len(indices) == 0 {
+		return false, nil
+	}
 	sort.Sort(indices)
 
-	store, err := datastore.GetOrderedKeyValueDB(d)
-	if err != nil {
+	writeOp := labels.NewOutputOp(w)
+	go labels.WriteBinaryBlocks(label, supervoxels, writeOp, bounds)
+
+	if err := d.writeBlocksConcurrently(ctx, scale, indices, writeOp); err != nil {
 		return false, err
 	}
-	op := labels.NewOutputOp(w)
-	go labels.WriteBinaryBlocks(label, supervoxels, op, bounds)
-	var preErr error
-	for _, izyx := range indices {
-		tk := NewBlockTKeyByCoord(scale, izyx)
-		data, err := store.Get(ctx, tk)
-		if err != nil {
-			preErr = err
-			break
-		}
-		if data == nil {
-			preErr = fmt.Errorf("expected block %s @ scale %d to have key-value, but found none", izyx, scale)
-			break
-		}
-		blockData, _, err := dvid.DeserializeData(data, true)
-		if err != nil {
-			preErr = err
-			break
-		}
-		var block labels.Block
-		if err := block.UnmarshalBinary(blockData); err != nil {
-			preErr = err
-			break
-		}
-		pb := labels.PositionedBlock{
-			Block:  block,
-			BCoord: izyx,
-		}
-		op.Process(&pb)
-	}
-	if err = op.Finish(); err != nil {
+	if err = writeOp.Finish(); err != nil {
 		return false, err
 	}
 
 	dvid.Infof("[%s] label %d consisting of %d supervoxels: streamed %d of %d blocks within bounds\n", ctx, label, len(supervoxels), len(indices), len(idx.Blocks))
-	return true, preErr
+	return true, nil
 }
 
 // writeStreamingRLE does a streaming write of an encoded sparse volume given a label.

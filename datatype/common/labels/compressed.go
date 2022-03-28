@@ -1834,7 +1834,7 @@ type OutputOp struct {
 func NewOutputOp(w io.Writer) *OutputOp {
 	op := new(OutputOp)
 	op.w = w
-	op.pbCh = make(chan *PositionedBlock, 1000)
+	op.pbCh = make(chan *PositionedBlock, 10000)
 	op.errCh = make(chan error)
 	return op
 }
